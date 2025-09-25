@@ -13,7 +13,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{delete, post},
+    routing::post,
     Json, Router,
 };
 use chrono::Utc;
@@ -24,11 +24,14 @@ use scrypt::{scrypt, Params};
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use sqlx::{SqlitePool, Row, Error as SqlxError};
+use sqlx::{SqlitePool, Row, Error as SqlxError, sqlite::SqliteConnectOptions};
+use totp_rs::{Algorithm, TOTP};
+use base64::Engine;
 
 #[derive(Clone)]
 struct AppState {
-    db: SqlitePool,
+    db: SqlitePool, // Persistent database for wallet data
+    totp_db: SqlitePool, // In-memory database for TOTP secrets
     jwt_secret: Vec<u8>,
 }
 
@@ -36,6 +39,11 @@ struct AppState {
 struct Register {
     username: String,
     password: String,
+}
+
+#[derive(Serialize)]
+struct RegisterResponse {
+    totp_url: String,
 }
 
 #[derive(Deserialize)]
@@ -52,13 +60,13 @@ struct Claims {
 
 #[derive(Deserialize)]
 struct GenerateKey {
-    passphrase: String,
+    totp_code: String,
 }
 
 #[derive(Deserialize)]
 struct SignMessage {
     message: String,
-    passphrase: String,
+    totp_code: String,
 }
 
 async fn init_db(pool: &SqlitePool) -> Result<(), SqlxError> {
@@ -82,6 +90,20 @@ async fn init_db(pool: &SqlitePool) -> Result<(), SqlxError> {
     Ok(())
 }
 
+async fn init_totp_db(totp_db: &SqlitePool) -> Result<(), SqlxError> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS totp_secrets (
+            user_id INTEGER PRIMARY KEY,
+            totp_secret TEXT NOT NULL
+        );
+        "#,
+    )
+        .execute(totp_db)
+        .await?;
+    Ok(())
+}
+
 async fn register(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Register>,
@@ -95,16 +117,56 @@ async fn register(
         .unwrap()
         .to_string();
 
+    // Derive TOTP secret from password hash using Scrypt
+    let mut totp_secret_bytes = [0u8; 32];
+    let params = Params::new(14, 8, 1, 32).unwrap();
+    scrypt(hash.as_bytes(), b"totp_salt", &params, &mut totp_secret_bytes).unwrap();
+
+    let _totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        totp_secret_bytes.to_vec(),
+    ).unwrap();
+    let totp_secret_b64 = base64::engine::general_purpose::STANDARD.encode(&totp_secret_bytes);
+    // Manually construct TOTP URL
+    let totp_url = format!(
+        "otpauth://totp/WalletServiceAuth:{}?secret={}&issuer=WalletServiceAuth&algorithm=SHA1&digits=6&period=30",
+        body.username, totp_secret_b64
+    );
+
     let result = sqlx::query(
         "INSERT INTO users (username, password_hash) VALUES (?, ?)",
     )
-        .bind(body.username)
-        .bind(hash)
+        .bind(&body.username)
+        .bind(&hash)
         .execute(&state.db)
         .await;
 
     match result {
-        Ok(_) => StatusCode::CREATED.into_response(),
+        Ok(_insert) => {
+            let user_id: i64 = sqlx::query("SELECT last_insert_rowid()")
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+                .get(0);
+
+            // Store TOTP secret in in-memory database
+            if let Err(e) = sqlx::query(
+                "INSERT INTO totp_secrets (user_id, totp_secret) VALUES (?, ?)",
+            )
+                .bind(user_id)
+                .bind(&totp_secret_b64)
+                .execute(&state.totp_db)
+                .await
+            {
+                eprintln!("Failed to store TOTP secret: {}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+
+            Json(RegisterResponse { totp_url }).into_response()
+        }
         Err(_) => StatusCode::CONFLICT.into_response(), // Username taken
     }
 }
@@ -146,11 +208,53 @@ async fn login(State(state): State<Arc<AppState>>, Json(body): Json<Login>) -> i
     StatusCode::UNAUTHORIZED.into_response()
 }
 
+async fn verify_totp(totp_db: &SqlitePool, user_id: i64, totp_code: &str) -> bool {
+    let totp_row = sqlx::query(
+        "SELECT totp_secret FROM totp_secrets WHERE user_id = ?",
+    )
+        .bind(user_id)
+        .fetch_optional(totp_db)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Database error in verify_totp: {}", e);
+            None
+        });
+
+    match totp_row {
+        Some(row) => {
+            let totp_secret_b64: String = row.get("totp_secret");
+            let totp_secret_bytes = match base64::engine::general_purpose::STANDARD.decode(&totp_secret_b64) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("Failed to decode TOTP secret: {}", e);
+                    return false;
+                }
+            };
+
+            let totp = TOTP::new(
+                Algorithm::SHA1,
+                6,
+                1,
+                30,
+                totp_secret_bytes,
+            ).unwrap();
+
+            totp.check_current(totp_code).unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
 async fn generate_key(
     Extension(claims): Extension<Claims>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<GenerateKey>,
 ) -> impl IntoResponse {
+    // Verify TOTP code
+    if !verify_totp(&state.totp_db, claims.sub, &body.totp_code).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let existing = sqlx::query(
         "SELECT user_id FROM wallets WHERE user_id = ?",
     )
@@ -180,12 +284,12 @@ async fn generate_key(
     let hash = hasher.finalize();
     let address = format!("0x{}", hex_encode(&hash[12..]));
 
-    // Derive encryption key with Scrypt
+    // Derive encryption key with Scrypt (using user_id as salt for simplicity)
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
     let params = Params::new(14, 8, 1, 32).unwrap();
     let mut dk = [0u8; 32];
-    scrypt(body.passphrase.as_bytes(), &salt, &params, &mut dk).unwrap();
+    scrypt(claims.sub.to_le_bytes().as_ref(), &salt, &params, &mut dk).unwrap();
 
     // Encrypt private key
     let cipher = Aes256Gcm::new_from_slice(&dk).unwrap();
@@ -220,6 +324,11 @@ async fn sign(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SignMessage>,
 ) -> impl IntoResponse {
+    // Verify TOTP code
+    if !verify_totp(&state.totp_db, claims.sub, &body.totp_code).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let wallet_row = sqlx::query(
         "SELECT encrypted_privkey, salt FROM wallets WHERE user_id = ?",
     )
@@ -235,10 +344,10 @@ async fn sign(
         let encrypted_privkey: Vec<u8> = w.get("encrypted_privkey");
         let salt: Vec<u8> = w.get("salt");
 
-        // Derive key
+        // Derive key (using user_id as input for Scrypt)
         let params = Params::new(14, 8, 1, 32).unwrap();
         let mut dk = [0u8; 32];
-        scrypt(body.passphrase.as_bytes(), &salt, &params, &mut dk).unwrap();
+        scrypt(claims.sub.to_le_bytes().as_ref(), &salt, &params, &mut dk).unwrap();
 
         // Decrypt
         let cipher = Aes256Gcm::new_from_slice(&dk).unwrap();
@@ -246,7 +355,7 @@ async fn sign(
         let ciphertext_slice = &encrypted_privkey[12..];
         let privkey_bytes: Vec<u8> = match cipher.decrypt(Nonce::from_slice(nonce_slice), ciphertext_slice) {
             Ok(p) => p,
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(), // Wrong passphrase
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(), // Invalid key
         };
         let secret_key = SecretKey::from_slice(&privkey_bytes).unwrap();
 
@@ -279,22 +388,20 @@ async fn sign(
 async fn forget(
     Extension(claims): Extension<Claims>,
     State(state): State<Arc<AppState>>,
+    Json(body): Json<GenerateKey>,
 ) -> impl IntoResponse {
-    if let Err(e) = sqlx::query("DELETE FROM wallets WHERE user_id = ?")
-        .bind(claims.sub)
-        .execute(&state.db)
-        .await
-    {
-        eprintln!("Database error in forget wallets: {}", e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // Verify TOTP code
+    if !verify_totp(&state.totp_db, claims.sub, &body.totp_code).await {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    if let Err(e) = sqlx::query("DELETE FROM users WHERE id = ?")
+    // Only delete TOTP secret
+    if let Err(e) = sqlx::query("DELETE FROM totp_secrets WHERE user_id = ?")
         .bind(claims.sub)
-        .execute(&state.db)
+        .execute(&state.totp_db)
         .await
     {
-        eprintln!("Database error in forget users: {}", e);
+        eprintln!("Database error in forget TOTP secret: {}", e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -352,16 +459,41 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if let Err(e) = init_db(&db).await {
+        eprintln!("Failed to initialize database at {}: {}", db_path.display(), e);
+        std::process::exit(1);
+    }
+
+    // Initialize in-memory TOTP database
+    let totp_db = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true),
+    )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to initialize in-memory TOTP database: {}", e);
+            std::process::exit(1);
+        });
+
+    if let Err(e) = init_totp_db(&totp_db).await {
+        eprintln!("Failed to initialize TOTP database: {}", e);
+        std::process::exit(1);
+    }
+
+    println!("Database initialized successfully at: {}", db_path.display());
+    println!("TOTP database initialized in memory");
+
     let jwt_secret = env::var("JWT_SECRET")
         .unwrap_or_else(|_| "supersecretkey".to_string())
         .into_bytes();
 
-    let state = Arc::new(AppState { db, jwt_secret });
+    let state = Arc::new(AppState { db, totp_db, jwt_secret });
 
     let protected_routes = Router::new()
         .route("/generate_key", post(generate_key))
         .route("/sign", post(sign))
-        .route("/forget", delete(forget))
+        .route("/forget", post(forget))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -373,13 +505,14 @@ async fn main() {
         .nest("/api", protected_routes)
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Server running on http://{}", addr);
 
     if let Err(e) = axum::serve(
         tokio::net::TcpListener::bind(&addr).await.unwrap(),
         app.into_make_service(),
-    ).await
+    )
+        .await
     {
         eprintln!("Server error: {}", e);
         std::process::exit(1);
