@@ -157,7 +157,7 @@ All tests completed. Check response files for details.
 ```
 
 **Comment.**
-In real world scenario, user expected to receive `{"totp_url":"otpauth://totp/WalletServiceAuth:testuser1?secret=ZQZ4JLJU5MQ6UXLWDX5PPAOFHSUIFRYQ&issuer=WalletServiceAuth&algorithm=SHA1&digits=6&period=30"}` as a response from `/login` rendered as a QR code by fronted to add it in Google Authenticator, Authy, or other TOTP auth apps. 
+In real world scenario, user expected to receive `{"totp_url":"otpauth://totp/WalletServiceAuth:testuser1?secret=ZQZ4JLJU5MQ6UXLWDX5PPAOFHSUIFRYQ&issuer=WalletServiceAuth&algorithm=SHA1&digits=6&period=30"}` as a response from `/register` rendered as a QR code by fronted to add it in Google Authenticator, Authy, or other TOTP auth apps. 
 
 ## Challenges
 ### 1. Security of network communications
