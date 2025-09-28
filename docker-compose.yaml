@@ -1,0 +1,43 @@
+version: '3.9'
+
+services:
+  wallet-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=1
+      - DATABASE_URL=postgres://wallet_user:wallet_pass@postgres:5432/wallet
+      - JWT_SECRET=${JWT_SECRET:-your-secure-jwt-secret}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - wallet-net
+
+  postgres:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=wallet_user
+      - POSTGRES_PASSWORD=wallet_pass
+      - POSTGRES_DB=wallet
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U wallet_user -d wallet -c 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - wallet-net
+    restart: unless-stopped
+
+networks:
+  wallet-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
