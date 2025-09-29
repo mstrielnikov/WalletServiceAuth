@@ -77,14 +77,14 @@ services:
 
 ## Challenges
 ### 1. Security of network communications
-The following secure design decisions impacted 
+The following secure design decisions impacted the complexity of software implementation
 * Implementing JWT tokens to prevent replay attacks and manage session expiry introduced complexity
 * Implementing TOTP (Time-Based One-Time Password) for protected endpoints added security related to management of sensitive data in database, tracking updates and encryption of the TOTP state
 
 ### 2. Secure storage of the sensitive data
 The main security issue is the persistence of sensitive data in memory. This issue is partially mitigated by: 
 * Used the aes-gcm crate for encryption, with a random salt (16 bytes) stored per record to derive encryption keys. No passwords are stored in plaintext, except their corresponded salted password hashes password_hash (Argon2) are stored in the users table. Decrypted secrets and keys are held in memory only during operations (e.g., TOTP verification, signing) and discarded afterward
-* Additional encryption on the volume level in production is necessary or dedicated secret management solution
+* Additional encryption on the volume level in production is necessary or a dedicated secret management solution
 
 ### 3. Software implementation
 * Careful management of database transactions in order to track user's TOTP setup and relevant state changes
@@ -92,30 +92,30 @@ The main security issue is the persistence of sensitive data in memory. This iss
 
 ## Improvements & TODO
 ### 1. Security of network communications
-The backend provided interacts with user a lot. Despite the fact, there is minimum sensitive information transfered, protection of initial `/register` & `/login` routes against Men-in-the-Middle attacks is still crucial. Standard TLS can be applied. No rate limiting or advanced auth.
+* The backend provided interacts with the user a lot. Despite the fact that there is minimal sensitive information transferred, protection of initial `/register` & `/login` routes against Men-in-the-Middle attacks is still crucial. Standard TLS can be applied. * No rate limiting or advanced auth
 
 ### 2. Frontend
-The presence of user-friendly fronted would be handy especially to vizualize the whole flow: `Register -> Login -> Generate Key -> Sign` and provide QR-code to user for login.
+The presence of a user-friendly front-end would be handy, especially for visualizing the entire flow: `Register -> Login -> Generate Key -> Sign`, and providing a QR code to the user for login.
 
 ### 3. Flexible login methods
-The integration different login methods would be beneficial to improve user experience and suitability to different scenarios using:
+The integration of different login methods would be beneficial to improve user experience and suitability to different scenarios using:
 * Optional integration with Mail or SMS based factors for potential reset functionality
 * Full-fledged OAuth integration like in [Sui blockchain](https://docs.sui.io/concepts/cryptography/zklogin) or other zkLogin implementations
-* PassKeys stored on user provided devices, cloud disks or hardware keys
+* PassKeys stored on user-provided devices, cloud disks, or hardware keys etc
 * Login with existing wallets or WalletConnect
 
 ### 4. Integrations with existing blockchains
-* For the backend provided only simulates assignation of ETH compatible wallet address. It would be more practical to allow user plug-in and auth own wallet. For example, via WalletConnect or TrustWallet integration etc.
-* Considering integration with different chains, the given Wallet-as-a-Service backend could be extended to authenticate user in dApps without exposing own wallets in multiple chains
+* The backend only simulates the assignment of an ETH-compatible wallet address. It would be more practical to allow users to plug in and authenticate their own wallets. For example, via WalletConnect or TrustWallet integration etc.
+* Considering integration with different chains, the given Wallet-as-a-Service backend could be extended to authenticate users in dApps without exposing their own wallets in multiple chains
 
 ### 5. No recovery
-No recovery for the lost passphrase (standard for wallets) if no MPC-based solutions considered or until OAuth compatibility / zk Login.
+No recovery for the lost passphrase (standard for wallets) if no MPC-based solutions are considered or until OAuth compatibility / zk Login.
 
 ### Use in production
 * Requires rate limiting to prevent abuse of endpoints or attacks  
 * Enable TLS for PostgreSQL
-* Single node deployment. The production may require scaling of application instances and enabling postgres replication
-* For the cases of high load and/or high availability read- and write- heavy workloads may be separated. Still advising to use postgres for looking up user and wallet data while message buss may be utilized for event processing like message signing, address assignation and JWT emitting.  
+* Single node deployment. The production may require scaling of application instances and enabling PostgreSQL replication
+* For the cases of high load and/or high availability, read- and write-heavy workloads may be separated. Still advise using PostgreSQL for looking up user and wallet data, while the message bus may be used for event processing, such as message signing, address assignment, and JWT emission.  
 
 ## Previous version
-There is old version [available in  branch](https://github.com/mstrielnikov/WalletServiceAuth/blob/master/src/main.rs) without 2FA.
+There is an old version [available in the branch](https://github.com/mstrielnikov/WalletServiceAuth/blob/master/src/main.rs) without 2FA.
