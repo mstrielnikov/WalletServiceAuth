@@ -8,8 +8,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - RUST_LOG=debug
-      - RUST_BACKTRACE=1
+#      - RUST_BACKTRACE=1
+      - RUST_LOG=info
       - DATABASE_URL=postgres://wallet_user:wallet_pass@postgres:5432/wallet
       - JWT_SECRET=${JWT_SECRET:-your-secure-jwt-secret}
     depends_on:

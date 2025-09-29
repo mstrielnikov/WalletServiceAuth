@@ -4,188 +4,103 @@ Wallet as a service for 'almost' passwordless blockchain wallet authentication b
 
 ## Design
 
-The application is designed as a RESTful API server that provides wallet services for a blockchain (assuming Ethereum-compatible, using secp256k1 for signatures). The server is implemented in Rust using the Axum framework for handling HTTP requests, SQLx for database interactions (with SQLite for simplicity), and various cryptography libraries for secure key generation, encryption, and signing.
+WalletServiceAuth application is a RESTful API server designed to provide secure wallet services for Ethereum-compatible blockchains (for ex.), using the `secp256k1` elliptic curve for key generation and message signing ([EIP-191](https://eips.ethereum.org/EIPS/eip-191) personal_sign format). Implemented in Rust using the `Axum` framework for HTTP request handling, `SQLx` for database interactions with PostgreSQL, and cryptography libraries (`aes-gcm`, `argon2`, `totp-rs`, `secp256k1`) for secure operations, the application prioritizes security and simplicity. It runs in a Dockerized environment with a docker-compose.yml configuration for easy deployment and testing.
 
-User authentication uses JWT tokens issued after password-based login. Passwords are hashed with Argon2.
+## Security focus
+* User Authentication: Uses JWT tokens issued via the `/login` endpoint, validated with a static `JWT_SECRET` (set to `your-secure-jwt-secret` in `docker-compose.yml`). Tokens expire after 1 hour
+* Two-Factor Authentication (TOTP): Requires a TOTP code for `/login` and protected endpoints (`/api/generate_key`, `/api/sign`, `/api/forget`), generated from a secret stored encrypted in the database. The TOTP secret is returned as a `totp_url` during `/register`
+* Password Hashing: Passwords are hashed with Argon2 and stored in the users table as password_hash. The password is not stored in plaintext and is used to derive encryption keys
+* Key Encryption: Private keys and TOTP secrets are encrypted with `AES-256-GCM` using a key derived from the user’s password. A random salt is stored per record for key derivation
+* Ephemeral Keys: Decrypted private keys and TOTP secrets are held in memory only during operations (signing or TOTP verification) and discarded afterward
+* Signature Format: Signatures follow Ethereum’s EIP-191 personal_sign format, as seen in the `/api/sign` response
 
-Signatures follow Ethereum's EIP-191 personal_sign format for message hashing.
+## Features
+1. Securely Connect:
+   1. Register: The `/register` endpoint creates a user with a unique username, password_hash, encrypted TOTP secret, and salt in the users table. Returns a totp_url for TOTP setup.
+   2. Login: The `/login` endpoint verifies the username, password, and totp_code, issuing a JWT token valid for 1 hour.
+2. Securely Generate Signature Key:
+   1. The `/api/generate_key` endpoint generates a secp256k1 key pair, computes an Ethereum address (e.g., 0x859f34feb9a7e8dde09e678f8b15b8afe017923f), encrypts the private key with a password-derived key, and stores it in the wallets table.
+3. Securely Generate Signatures:
+   1. The `/api/sign` endpoint decrypts the private key using the provided password and totp_code, signs a message (e.g., Hello, world!), and returns an EIP-191-compliant signature.
+4. Securely Be Forgotten:
+   1.The `/api/forget` endpoint deletes the user’s records from both users and wallets tables, allowing re-registration.
 
+See [ENDPOINTS.md](./ENDPOINTS.md) for detailed API endpoints description and request examples.
 
-## Endpoints
+See [SCHEMA.md](./SCHEMA.md) for detailed description of Postgresql DB schema and SQL actions performed per API endpoint above.
 
-### 1. Register: `/register`
+## Try wallet-as-a-service
+### Prerequisites
+* Docker (20.10.0+)
+* Docker-compose (3.5+)
+* curl
+* (optional) TOTP authenticator (Google Authenticator, Authy, qrencode (CLI),  etc)
 
-Register user by providing traditional `usenname` & `password`. It's required to bootstrap TOTP which will be prefered for authorized API usage instead of `username` + `password`.
-TOTP setup derived from salted hash over password and saved alongside with plain `username`. No password or password has is stored in DB.
+### Deployment
+The `docker-compose.yaml` defines two services:
+* `wallet-service` (Rust app)
+* `postgres` (PostgreSQL database) as a persistence layer
 
+Run:
 ```bash
-curl -X POST http://localhost:3000/register \
--H "Content-Type: application/json" \
--d "{\"username\":\"$TEST_USER\",\"password\":\"$TEST_PASS\"}"
+docker-compose down -v  # Clear existing containers and volumes for PG fresh start
+docker-compose up --build --force-recreate
 ```
 
-Expected response:
+Check logs:
 ```bash
-{"totp_url":"otpauth://totp/WalletServiceAuth:testuser1?secret=<base32_secret>&issuer=WalletServiceAuth&algorithm=SHA1&digits=6&period=30"}
+docker logs walletserviceauth_wallet-service_1 
 ```
 
-### 2. Initiate app session (aka Login): `/login`
-Login user by `usenname` & `password` to get session-wide (1h default hard-coded) JWT-token.
-
-```bash
-curl -X POST http://localhost:3000/login \
--H "Content-Type: application/json" \
--d "{\"username\":\"$TEST_USER\",\"password\":\"$TEST_PASS\"}"
+Verify DB:
 ```
-
-Expected response `200` with:
-```bash
-{"token":"<jwt_token>"}
+docker exec -it walletserviceauth_postgres_1 psql -U wallet_user -d wallet -c "SELECT * FROM users;"
+docker exec -it walletserviceauth_postgres_1 psql -U wallet_user -d wallet -c "SELECT * FROM wallets;"
 ```
-
-### 3. Generate signature key: `/api/generate_key`
-JWT + TOTP authed & protected endpoint for logined user to generate a public signature as ETH compatible blockchain address.  
-
-```bash
-curl -X POST http://localhost:3000/api/generate_key \
--H "Authorization: Bearer $TOKEN" \
--H "Content-Type: application/json" \
--d "{\"totp_code\":\"$TOTP\"}"
-```
-
-Expected response `200` with:
-```bash
-{"address":"0x<ethereum_address>"}
-```
-
-### 4. Message signing: `/api/sign`
-JWT + TOTP authed & protected endpoint f{"signature":"0x<r_value><s_value><v_value>"}or logined user to sign messages (for ex.: Wallet's tx's).
-
-```bash
-# For ex.: MSG="Hello, Blockchain!"
-curl -X POST http://localhost:3000/api/sign \
--H "Authorization: Bearer $TOKEN" \
--H "Content-Type: application/json" \
--d "{\"message\":\"$MSG\",\"totp_code\":\"$TOTP\"}"
-```
-
-Expected response:
-```bash
-{"signature":"0x<r_value><s_value><v_value>"}
-```
-
-### 5. Deletion of user's TOTP setup: `/api/forget`
-   JWT + TOTP authed & protected endpoint for logined user to delete user's TOTP setup in order to reinstantinate it or delete permanently.
-
-```bash
-curl -X POST http://localhost:3000/api/forget \
--H "Authorization: Bearer $TOKEN" \
--H "Content-Type: application/json" \
--d "{\"totp_code\":\"$TOTP\"}"
-```
-
-Expected response is status `200`.
-
-## Try
-Run `run.sh` script to try the Wallet-as-a-Service auth backend. 
-Ensure that `run.sh` is executable via `chmod +x run.sh`.
-
-The script will pack the app using [Dockerfile provided](./Dockerfile) to launch the backend.
 
 ### Mandatory ENV vars
 There are a couple of ENV vars set:
-```Dockerfile
-# JWT test token stab
-ENV JWT_SECRET=supersecretkey
-# Verbosity
-ENV RUST_LOG=info
+```yaml
+services:
+  wallet-service:
+    environment:
+#     - RUST_BACKTRACE=1  (optional)
+      - RUST_LOG=info
+      - DATABASE_URL=postgres://wallet_user:wallet_pass@postgres:5432/wallet
+      - JWT_SECRET=your-secure-jwt-secret
+  postgres:
+    environment:
+      - POSTGRES_USER=wallet_user
+      - POSTGRES_PASSWORD=wallet_pass
+      - POSTGRES_DB=wallet
 ```
-
-Here `JWT_SECRET` is initialized with stab 'supersecretkey' for testing purposes.
-In normal flow, `JWT_SECRET` should be returned from backend by `/register` to user for authorized execution within protected auth API's (`/api/generate_key`, `/api/sign`, `/api/forget`).
-Example of expected response:
-```bash
-{"totp_url":"otpauth://totp/WalletServiceAuth:testuser1?secret=LSVXVS26N2ZWMZVBEOYE5FDKHFPKWQWD&issuer=WalletServiceAuth&algorithm=SHA1&digits=6&period=30"} 
-```
-
-### Mandatory files
-1. Ensure `./data` dir exist in the root of repo: `mkdir ./data`
-2. Ensure sqlite in-file db exists within `./data`: `touch ./data/wallet.db # exact db name required`
-
-You can see these files are created automatically within test [Dockerfile provided](./Dockerfile). 
-
-### Full testing scenario example
-
-1. Up the [demo dockerfile](./Dockerfile) with `run.sh` [script provided](./run.sh)
-2. Run the [test script](./tests/scripts/test.sh) or `curl` queries manually (examples provided above) 
-
-The example of out logs for the backend:
-```bash
-RUST_BACKTRACE=1 RUST_LOG=info cargo run
-Server running on http://0.0.0.0:3000
-# Triggered endpoint /register 
-# Triggered endpoint /login
-[2025-09-25T22:05:13Z INFO  WalletServiceAuth] Generated TOTP for testuser: code=287623
-```
-
-Result of test script running:
-```bash
-./test.sh 
-Testing Register...
-Register Success
-{"totp_url":"otpauth://totp/WalletServiceAuth:testuser?secret=QL4SSWSNQX46DK5WHP7FPM3ZDGXI7QZX&issuer=WalletServiceAuth&algorithm=SHA1&digits=6&period=30"}Enter current TOTP code from authenticator (e.g., 022681): 
-287623
-Debug: Extracted TOTP code: 287623
-Testing Login...
-Login Success, Token Saved
-Testing Generate Key...
-Debug: JSON sent to Generate Key: {"totp_code":"287623"}
-Generate Key Success
-{"address":"0xc32b6977199756d26ba5d97c7dad4cb8f5ef0ceb"}Testing Sign...
-Debug: JSON sent to Sign: {"message":"Hello, Blockchain!","totp_code":"287623"}
-Sign Success
-{"signature":"0x0974dff4b59a9ee8f4054f13358504360a2d1348797d3c0dd026087919d02503386d860454a5c4f7b797487b3025d87d3a4575f075ee7e630b6cb6ba6063ba521b"}Testing Forget...
-Debug: JSON sent to Forget: {"totp_code":"287623"}
-Forget Success
-Testing Re-Register...
-Re-Register Failed: Username already exists
-Username already exists
-All tests completed. Check response files for details.
-
-# if repeated for different uset 
-[2025-09-25T22:14:56Z INFO  WalletServiceAuth] Generated TOTP for testuser1: code=218495
-```
-
-**Comment.**
-In real world scenario, user expected to receive `{"totp_url":"otpauth://totp/WalletServiceAuth:testuser1?secret=ZQZ4JLJU5MQ6UXLWDX5PPAOFHSUIFRYQ&issuer=WalletServiceAuth&algorithm=SHA1&digits=6&period=30"}` as a response from `/register` rendered as a QR code by fronted to add it in Google Authenticator, Authy, or other TOTP auth apps. 
 
 ## Challenges
 ### 1. Security of network communications
-The following design decisions impacted a
-* JWT tokens are used to prevent reply attacks using intercepted user prompts or expired sessions
-* TOTP implemented additionally to generate dynamic short-living passwords to authorize user requests
+The following secure design decisions impacted 
+* Implementing JWT tokens to prevent replay attacks and manage session expiry introduced complexity
+* Implementing TOTP (Time-Based One-Time Password) for protected endpoints added security related to management of sensitive data in database, tracking updates and encryption of the TOTP state
 
 ### 2. Secure storage of the sensitive data
-The main security issue is the persistence of sensitive data in memory. This issue is partially mitigated by:
-* Usage of a DB (sqlite) without direct exposure to the network, making "this particular machine" is the last line of defence and side channel-attacks to steal the data from memory 
-* No explicit password stored in memory. The salted hash of the password does not stored either and used only to generate TOTP setup. TOTP params with corresponding usernames are stored in DB. Potential leakage of DB content exposes TOTP codes but not allows to steal "user's identity" or reuse them if expired.
-* The DB's content is not encrypted. 
+The main security issue is the persistence of sensitive data in memory. This issue is partially mitigated by: 
+* Used the aes-gcm crate for encryption, with a random salt (16 bytes) stored per record to derive encryption keys. No passwords are stored in plaintext, except their corresponded salted password hashes password_hash (Argon2) are stored in the users table. Decrypted secrets and keys are held in memory only during operations (e.g., TOTP verification, signing) and discarded afterward
+* Additional encryption on the volume level in production is necessary or dedicated secret management solution
 
-### 3. Software implementation 
-* Usage of JWT, TOTP, Signatures introduces a lot of complexity to the code on its own
+### 3. Software implementation
 * Careful management of database transactions in order to track user's TOTP setup and relevant state changes
+* Selection and integration of dependencies
 
 ## Improvements & TODO
 ### 1. Security of network communications
-The backend provided interacts with user a lot. Despite the fact, there is minimum sensitive information transfered, protection of initial `/register` & `/login` routes against Men-in-the-Middle attacks is still crucial. Standard TLS can be apply. No rate limiting or advanced auth.
+The backend provided interacts with user a lot. Despite the fact, there is minimum sensitive information transfered, protection of initial `/register` & `/login` routes against Men-in-the-Middle attacks is still crucial. Standard TLS can be applied. No rate limiting or advanced auth.
 
 ### 2. Frontend
-The presence of user friendly fronted would be handy especially to vizualize the whole flow: `Register -> Login -> Generate Key -> Sign` and provide QR-code to user for login.
+The presence of user-friendly fronted would be handy especially to vizualize the whole flow: `Register -> Login -> Generate Key -> Sign` and provide QR-code to user for login.
 
 ### 3. Flexible login methods
 The integration different login methods would be beneficial to improve user experience and suitability to different scenarios using:
 * Optional integration with Mail or SMS based factors for potential reset functionality
-* Full fledged OAuth integration like in [Sui blockchain](https://docs.sui.io/concepts/cryptography/zklogin) or other zkLogin implementations
+* Full-fledged OAuth integration like in [Sui blockchain](https://docs.sui.io/concepts/cryptography/zklogin) or other zkLogin implementations
 * PassKeys stored on user provided devices, cloud disks or hardware keys
 * Login with existing wallets or WalletConnect
 
@@ -196,6 +111,11 @@ The integration different login methods would be beneficial to improve user expe
 ### 5. No recovery
 No recovery for the lost passphrase (standard for wallets) if no MPC-based solutions considered or until OAuth compatibility / zk Login.
 
+### Use in production
+* Requires rate limiting to prevent abuse of endpoints or attacks  
+* Enable TLS for PostgreSQL
+* Single node deployment. The production may require scaling of application instances and enabling postgres replication
+* For the cases of high load and/or high availability read- and write- heavy workloads may be separated. Still advising to use postgres for looking up user and wallet data while message buss may be utilized for event processing like message signing, address assignation and JWT emitting.  
+
 ## Previous version
-There is old version [available in  branch](https://github.com/mstrielnikov/WalletServiceAuth/blob/master/src/main.rs) using password.
-It authorizes protected API routes with signed JWTs. Each signature made with user's password.
+There is old version [available in  branch](https://github.com/mstrielnikov/WalletServiceAuth/blob/master/src/main.rs) without 2FA.
