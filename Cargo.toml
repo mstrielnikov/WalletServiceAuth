@@ -7,6 +7,10 @@ edition = "2024"
 name = "wallet-service"
 path = "src/main.rs"
 
+[lib]
+name = "wallet_service_auth"
+path = "src/lib.rs"
+
 [dependencies]
 axum = { version = "0.8.4", features = ["macros"] }
 tokio = { version = "1.47.1", features = ["full"] }
@@ -15,22 +19,20 @@ serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.132"
 hex = "0.4.3"
 jsonwebtoken = "9.3.1"
-argon2 = "0.5.3"
 secp256k1 = { version = "0.29.0", features = ["rand-std"] }
-aes-gcm = "0.10.3"
 rand = "0.8.5"
 sha3 = "0.10.8"
-totp-rs = "5.7.0"
 log = "0.4.28"
 env_logger = "0.11.8"
-base32 = "0.4"
 async-trait = "0.1.80"
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
-uuid = { version = "1.8.0", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 moka = { version = "0.12", features = ["future"] }
-# Vendor-compile OpenSSL 3.x so webauthn-rs 0.5 works on systems with OpenSSL 1.x
-openssl = { version = "0.10", features = ["vendored"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Vendor-compile OpenSSL 3.x — required by webauthn-rs on systems with OpenSSL < 3.0
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12.8", features = ["json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+tower   = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

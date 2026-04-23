@@ -151,7 +151,6 @@ impl DbClient {
     }
 
 
-
     /// Fetches a Meta-Account by its canonical identifier
     pub async fn get_meta_account_by_identifier(
         &self,
