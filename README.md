@@ -1,121 +1,224 @@
-# WalletServiceAuth
+# PQWaaS
 
-Wallet as a service for 'almost' passwordless blockchain wallet authentication backend.
+**Chain-agnostic, Post-Quantum-Ready Wallet-as-a-Service (WaaS) platform.**  
+Passwordless authentication · MPC-distributed key management · Cross-chain intent routing
 
-## Design
+---
 
-WalletServiceAuth application is a RESTful API server designed to provide secure wallet services for Ethereum-compatible blockchains (for ex.), using the `secp256k1` elliptic curve for key generation and message signing ([EIP-191](https://eips.ethereum.org/EIPS/eip-191) personal_sign format). Implemented in Rust using the `Axum` framework for HTTP request handling, `SQLx` for database interactions with PostgreSQL, and cryptography libraries (`aes-gcm`, `argon2`, `totp-rs`, `secp256k1`) for secure operations, the application prioritizes security and simplicity. It runs in a Dockerized environment with a docker-compose.yml configuration for easy deployment and testing.
+## Overview
 
-## Security focus
-* User Authentication: Uses JWT tokens issued via the `/login` endpoint, validated with a static `JWT_SECRET` (set to `your-secure-jwt-secret` in `docker-compose.yml`). Tokens expire after 1 hour
-* Two-Factor Authentication (TOTP): Requires a TOTP code for `/login` and protected endpoints (`/api/generate_key`, `/api/sign`, `/api/forget`), generated from a secret stored encrypted in the database. The TOTP secret is returned as a `totp_url` during `/register`
-* Password Hashing: Passwords are hashed with Argon2 and stored in the users table as password_hash. The password is not stored in plaintext and is used to derive encryption keys
-* Key Encryption: Private keys and TOTP secrets are encrypted with `AES-256-GCM` using a key derived from the user’s password. A random salt is stored per record for key derivation
-* Ephemeral Keys: Decrypted private keys and TOTP secrets are held in memory only during operations (signing or TOTP verification) and discarded afterward
-* Signature Format: Signatures follow Ethereum’s EIP-191 personal_sign format, as seen in the `/api/sign` response
+A modular, horizontally scalable WaaS platform written in Rust (`Axum` + `Tokio`). The platform separates **identity** from **payment routing** and delegates private key custody entirely to an external MPC network — no secret material is stored on the server.
+
+| Aspect         |                                                                |
+| -------------- | -------------------------------------------------------------- |
+| Auth           | Passwordless **FIDO2 / WebAuthn** Passkeys                     |
+| Storage        | **Turso / libSQL** (multi-DC, horizontally scalable)           |
+| Key custody    | **MPC network** (Lit Protocol / Turnkey model)                 |
+| Identity model | **Meta-Account** (identity ↔ N ephemeral addresses)            |
+| PQC readiness  | **Track B** – mock SPHINCS+ path, `pqc_signature_capable` flag |
+| Chains         | Chain-agnostic (`chain_id` field, any EVM / Solana / Starknet) |
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                          Axum HTTP Layer                         │
+│   /meta_account/*   /auth/*   /wallet/ephemeral/*   /paymaster/* │
+└────────────────────────┬─────────────────────────────────────────┘
+                         │
+          ┌──────────────┼───────────────────┐
+          ▼              ▼                   ▼
+   ┌─────────────┐ ┌──────────┐    ┌─────────────────┐
+   │  state.rs   │ │ auth.rs  │    │   handlers/     │
+   │  AppState   │ │Typestate │    │ auth / wallet / │
+   │  + moka TTL │ │pipeline  │    │  paymaster      │
+   └──────┬──────┘ └──────────┘    └────────┬────────┘
+          │                                  │
+     ┌────┴────┐                      ┌──────┴──────┐
+     │  db.rs  │                      │   mpc.rs    │
+     │ DbClient│                      │ MpcProvider │
+     │ (libSQL)│                      │  (trait)    │
+     └────┬────┘                      └──────┬──────┘
+          │                                  │
+     Turso / libSQL               MPC Network (Lit / Turnkey)
+     (local replica +             off-server key custody
+      remote sync)
+```
+
+**Module layout:**
+
+```
+src/
+├── main.rs              # Server bootstrap only (44 lines)
+├── state.rs             # AppState + build()
+├── auth.rs              # Typestate auth engine (Init→Challenged→Verified)
+├── mpc.rs               # MpcProvider trait + MockLitTurnkeyApi
+├── db.rs                # DbClient (libSQL async)
+├── models/
+│   ├── domain.rs        # MetaAccount, EphemeralAddress, Claims
+│   └── dto.rs           # All request/response DTOs
+└── handlers/
+    ├── auth.rs          # WebAuthn register + login handlers
+    ├── wallet.rs        # Ephemeral wallet handlers
+    └── paymaster.rs     # Cross-chain swap intent handler
+```
+
+---
 
 ## Features
-1. Securely Connect:
-   1. Register: The `/register` endpoint creates a user with a unique username, password_hash, encrypted TOTP secret, and salt in the users table. Returns a totp_url for TOTP setup.
-   2. Login: The `/login` endpoint verifies the username, password, and totp_code, issuing a JWT token valid for 1 hour.
-2. Securely Generate Signature Key:
-   1. The `/api/generate_key` endpoint generates a secp256k1 key pair, computes an Ethereum address (e.g., 0x859f34feb9a7e8dde09e678f8b15b8afe017923f), encrypts the private key with a password-derived key, and stores it in the wallets table.
-3. Securely Generate Signatures:
-   1. The `/api/sign` endpoint decrypts the private key using the provided password and totp_code, signs a message (e.g., Hello, world!), and returns an EIP-191-compliant signature.
-4. Securely Be Forgotten:
-   1.The `/api/forget` endpoint deletes the user’s records from both users and wallets tables, allowing re-registration.
 
-See [ENDPOINTS.md](./ENDPOINTS.md) for detailed API endpoints description and request examples.
+### Passwordless Authentication (WebAuthn / FIDO2)
 
-See [SCHEMA.md](./SCHEMA.md) for detailed description of Postgresql DB schema and SQL actions performed per API endpoint above.
+- Two-step passkey registration (`register_start` / `register_finish`)
+- Two-step passkey login (`login_start` / `login_finish`) returning a signed JWT
+- Session challenges stored in an embedded **moka** async cache with 5-minute TTL; ready to swap for Redis in multi-node deployments
+- Auth state machine enforced at compile time via the **typestate pattern** (`Init → Challenged → Verified`) — impossible to call `verify` before `challenge`
+- Pluggable `AuthProvider` trait: adding TOTP, OAuth, or hardware-key providers requires only a new struct, no handler changes
 
-## Try wallet-as-a-service
+### MPC-Backed Ephemeral Wallets
+
+- **Track A (ECDSA):** Delegates key generation to the MPC network; only the network key ID is persisted server-side
+- **Track B (PQC):** `use_pqc: true` triggers a mock SPHINCS+ key path — address derivation and signing are routed through the PQC branch; ready for a real `pqc` crate integration
+- Addresses are linked to the caller's `MetaAccount` with full lifecycle tracking (`active → used → revoked`)
+- Distributed signing via `MpcProvider::sign_payload` — ECDSA and mocked PQC signing paths both functional
+
+### Turso / libSQL Database
+
+- Schema initialised at startup; no migration tool required
+- Supports Turso remote replica + local sync (set `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`); falls back to a local SQLite file
+- `DbClient` provides typed async methods for all CRUD operations against `meta_accounts` and `ephemeral_addresses`
+- Domain types defined once in `src/models/domain.rs`, imported everywhere
+
+### Cross-Chain Paymaster Intent
+
+- `POST /paymaster/swap_intent` accepts a chain-agnostic intent (collateral chain/asset → destination chain/asset)
+- Provisions a one-time proxy address on the destination chain via the MPC network and records it under the caller's `MetaAccount`
+- Returns an `intent_id`, estimated fee (0.3 % mock slippage), and the assigned proxy address
+- Execution queue is a stub — designed for integration with an atomic swap or bridge protocol
+
+---
+
+## Running Locally
+
 ### Prerequisites
-* Docker (20.10.0+)
-* Docker-compose (3.5+)
-* curl
-* (optional) TOTP authenticator (Google Authenticator, Authy, qrencode (CLI),  etc)
 
-### Deployment
-The `docker-compose.yaml` defines two services:
-* `wallet-service` (Rust app)
-* `postgres` (PostgreSQL database) as a persistence layer
+- Rust 1.75+
+- `JWT_SECRET` environment variable set
+- (Optional) Turso account for remote DB: `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`
 
-Run:
+### Local SQLite mode (fastest)
+
 ```bash
-docker-compose down -v  # Clear existing containers and volumes for PG fresh start
-docker-compose up --build --force-recreate
+export JWT_SECRET=dev-secret
+export RUST_LOG=info
+cargo run
+# Server starts on http://0.0.0.0:3000
+# SQLite DB created at ./wallet.db
 ```
 
-Check logs:
+### Remote Turso mode
+
 ```bash
-docker logs walletserviceauth_wallet-service_1 
+export JWT_SECRET=your-production-secret
+export TURSO_DATABASE_URL=libsql://your-db.turso.io
+export TURSO_AUTH_TOKEN=your-token
+export RUST_LOG=info
+cargo run
 ```
 
-Verify DB:
-```
-docker exec -it walletserviceauth_postgres_1 psql -U wallet_user -d wallet -c "SELECT * FROM users;"
-docker exec -it walletserviceauth_postgres_1 psql -U wallet_user -d wallet -c "SELECT * FROM wallets;"
-```
+### Verify
 
-### Mandatory ENV vars
-There are a couple of ENV vars set:
-```yaml
-services:
-  wallet-service:
-    environment:
-#     - RUST_BACKTRACE=1  (optional)
-      - RUST_LOG=info
-      - DATABASE_URL=postgres://wallet_user:wallet_pass@postgres:5432/wallet
-      - JWT_SECRET=your-secure-jwt-secret
-  postgres:
-    environment:
-      - POSTGRES_USER=wallet_user
-      - POSTGRES_PASSWORD=wallet_pass
-      - POSTGRES_DB=wallet
+```bash
+curl http://localhost:3000/health
+# → OK
 ```
 
-## Challenges
-### 1. Security of network communications
-The following secure design decisions impacted the complexity of software implementation
-* Implementing JWT tokens to prevent replay attacks and manage session expiry introduced complexity
-* Implementing TOTP (Time-Based One-Time Password) for protected endpoints added security related to management of sensitive data in database, tracking updates and encryption of the TOTP state
+---
 
-### 2. Secure storage of the sensitive data
-The main security issue is the persistence of sensitive data in memory. This issue is partially mitigated by: 
-* Used the aes-gcm crate for encryption, with a random salt (16 bytes) stored per record to derive encryption keys. No passwords are stored in plaintext, except their corresponded salted password hashes password_hash (Argon2) are stored in the users table. Decrypted secrets and keys are held in memory only during operations (e.g., TOTP verification, signing) and discarded afterward
-* Additional encryption on the volume level in production is necessary or a dedicated secret management solution
+## Environment Variables
 
-### 3. Software implementation
-* Careful management of database transactions in order to track user's TOTP setup and relevant state changes
-* Selection and integration of dependencies
+| Variable             | Required | Default                 | Description                                            |
+| -------------------- | -------- | ----------------------- | ------------------------------------------------------ |
+| `JWT_SECRET`         | **Yes**  | —                       | HMAC-SHA256 signing secret for JWT tokens              |
+| `TURSO_DATABASE_URL` | No       | `wallet.db`             | Turso remote URL or `file:./wallet.db`                 |
+| `TURSO_AUTH_TOKEN`   | No       | `""`                    | Auth token for Turso remote connections                |
+| `TURSO_LOCAL_URL`    | No       | `local_sync.db`         | Local replica path for remote sync mode                |
+| `WEBAUTHN_RP_ID`     | No       | `localhost`             | WebAuthn relying party ID (set to your domain in prod) |
+| `WEBAUTHN_ORIGIN`    | No       | `http://localhost:3000` | WebAuthn origin (must match browser origin exactly)    |
+| `RUST_LOG`           | No       | `info`                  | Log level (`trace`, `debug`, `info`, `warn`, `error`)  |
 
-## Improvements & TODO
-### 1. Security of network communications
-* The backend provided interacts with the user a lot. Despite the fact that there is minimal sensitive information transferred, protection of initial `/register` & `/login` routes against Men-in-the-Middle attacks is still crucial. Standard TLS can be applied. * No rate limiting or advanced auth
+---
 
-### 2. Frontend
-The presence of a user-friendly front-end would be handy, especially for visualizing the entire flow: `Register -> Login -> Generate Key -> Sign`, and providing a QR code to the user for login.
+## Documentation
 
-### 3. Flexible login methods
-The integration of different login methods would be beneficial to improve user experience and suitability to different scenarios using:
-* Optional integration with Mail or SMS based factors for potential reset functionality
-* Full-fledged OAuth integration like in [Sui blockchain](https://docs.sui.io/concepts/cryptography/zklogin) or other zkLogin implementations
-* PassKeys stored on user-provided devices, cloud disks, or hardware keys etc
-* Login with existing wallets or WalletConnect
+| Document                       | Description                                                                       |
+| ------------------------------ | --------------------------------------------------------------------------------- |
+| [ENDPOINTS.md](./ENDPOINTS.md) | Full API reference: request/response schemas, user sequence diagrams, error codes |
+| [SCHEMA.md](./SCHEMA.md)       | Database schema, DDL, DB operation reference, Rust domain types, migration notes  |
 
-### 4. Integrations with existing blockchains
-* The backend only simulates the assignment of an ETH-compatible wallet address. It would be more practical to allow users to plug in and authenticate their own wallets. For example, via WalletConnect or TrustWallet integration etc.
-* Considering integration with different chains, the given Wallet-as-a-Service backend could be extended to authenticate users in dApps without exposing their own wallets in multiple chains
+---
 
-### 5. No recovery
-No recovery for the lost passphrase (standard for wallets) if no MPC-based solutions are considered or until OAuth compatibility / zk Login.
+## Security Notes
 
-### Use in production
-* Requires rate limiting to prevent abuse of endpoints or attacks  
-* Enable TLS for PostgreSQL
-* Single node deployment. The production may require scaling of application instances and enabling PostgreSQL replication
-* For the cases of high load and/or high availability, read- and write-heavy workloads may be separated. Still advise using PostgreSQL for looking up user and wallet data, while the message bus may be used for event processing, such as message signing, address assignment, and JWT emission.  
+- **No passwords stored** — ever. Authentication relies entirely on hardware-bound passkey signatures
+- **No private keys stored** — only MPC network key IDs are persisted; the actual key material stays in the enclave
+- **Challenge TTL** — registration and login sessions expire after 5 minutes via moka cache eviction
+- **JWT expiry** — tokens are valid for 1 hour (`exp` claim)
+- **PQC flag** — addresses can be tagged `pqc_signature_capable` in preparation for quantum-resistant signing pipelines
 
-## Previous version
-There is an old version [available in the branch](https://github.com/mstrielnikov/WalletServiceAuth/blob/master/src/main.rs) without 2FA.
+---
+
+### Mocked / In-Progress
+
+| Feature                                        | Status         | Notes                                                                                   |
+| ---------------------------------------------- | -------------- | --------------------------------------------------------------------------------------- |
+| MPC network calls                              | **Mocked**     | `MockLitTurnkeyApi` simulates Turnkey/Lit Protocol; replace with real HTTP client       |
+| PQC signing (SPHINCS+)                         | **Mocked**     | Returns `0xPQC_MOCK_…` prefixed Keccak hash; plug in `pqc` or `oqs` crate               |
+| `sign_ephemeral` key lookup                    | **Stub**       | `get_ephemeral_address_by_id` not yet in `DbClient`; `network_key_id` is empty string   |
+| FIDO assertion enforcement on wallet endpoints | **Stub**       | `auth_assertion` field present in DTOs; verification not yet wired                      |
+| JWT middleware guard                           | **Planned**    | JWT issued at login; `Authorization: Bearer` validation on `/wallet/*` not yet enforced |
+| Atomic swap executor                           | **Planned**    | Intent queued but no swap/bridge execution engine                                       |
+| Multi-device passkeys                          | **Planned**    | `auth_methods_json` stores a single `Passkey`; extend to `Vec<Passkey>`                 |
+| TOTP provider                                  | **Scaffolded** | `TotpProvider` struct in `src/auth.rs`; challenge/verify logic is a placeholder         |
+| Session store (Redis)                          | **Planned**    | moka cache works for single-node; swap to `deadpool-redis` for cluster mode             |
+
+---
+
+### Roadmap
+
+#### Phase 1 — Foundation
+
+- [x] Turso/libSQL migration with Meta-Account schema
+- [x] WebAuthn passkey registration + login
+- [x] JWT session issuance
+- [x] MPC provider trait + mock implementation
+- [x] Ephemeral address generation (Track A ECDSA + Track B PQC mock)
+- [x] Cross-chain paymaster intent stub
+- [x] Typestate auth engine
+- [x] Domain-driven module layout
+
+#### Phase 2 — Production Hardening
+
+- [ ] Real Lit Protocol / Turnkey HTTP client (replaces `MockLitTurnkeyApi`)
+- [ ] `get_ephemeral_address_by_id` DB query + sign flow completion
+- [ ] Axum JWT middleware (`Authorization: Bearer` guard on `/wallet/*` and `/paymaster/*`)
+- [ ] FIDO assertion verification on all mutation endpoints
+- [ ] Redis session store for multi-instance deployments
+- [ ] Rate limiting (`tower-governor`) on all public endpoints
+- [ ] TLS termination
+
+#### Phase 3 — Post-Quantum & Multi-Chain
+
+- [ ] Integrate `oqs` / `liboqs` for real SPHINCS+ / Dilithium key generation and signing
+- [ ] ZKvm bridge for PQC ↔ legacy chain compatibility
+- [ ] Multi-device passkey support (`Vec<Passkey>` in `auth_methods_json`)
+- [ ] One-time address enforcement (`status = 'used'` after first transaction)
+- [ ] TOTP provider completion (RFC 6238 via `totp-rs`)
+- [ ] Atomic swap executor integration (e.g., Across Protocol, Connext)
+- [ ] Distributed MPC coordinator (proprietary PQC-threshold signing)
+
+---
+
+> The current build is a **platform scaffold**. Mocked endpoints (see table above) must be replaced before production use. Rate limiting, TLS, and a Redis session store are required for any multi-user deployment.

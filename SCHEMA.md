@@ -1,155 +1,215 @@
-# SCHEMA 
+# SCHEMA
 
-Schema Database Actions
+> **Database:** Turso / libSQL (SQLite wire-compatible, horizontally scalable, encrypted-at-rest)  
+> **Migration strategy:** `CREATE TABLE IF NOT EXISTS` executed at startup via `DbClient::init_schema()`  
+> **Previous engine:** PostgreSQL (retired — see git history)
 
-## DB TABLES
-The WalletServiceAuth application interacts with a PostgreSQL database containing two tables: users and wallets. Below are the database actions performed by each API endpoint, as derived from the application code and logs.
-Database Schema
+---
 
-*  Table `users`. Stores user data with a unique username, hashed password, encrypted TOTP secret, and salt.
-```sql
-CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,                -- id: Auto-incrementing primary key (SERIAL, maps to INT4)
-    username TEXT NOT NULL UNIQUE,        -- username: Unique user identifier
-    password_hash TEXT NOT NULL,          -- password_hash: Argon2 hash of the password
-    encrypted_totp_secret BYTEA NOT NULL, -- encrypted_totp_secret: AES-256-GCM encrypted TOTP secret
-    salt BYTEA NOT NULL                   -- salt: Random salt for password hashing and encryption
-)
+## Architecture Overview
+
+The schema implements a **Hedera-inspired Meta-Account model**: identity is fully decoupled from payment addresses. A single canonical user (`meta_accounts`) can own many one-time or reusable proxy addresses (`ephemeral_addresses`) across any number of chains, with no raw private key material ever stored server-side (key shards live in the MPC network).
+
+```
+┌─────────────────────────────┐        ┌──────────────────────────────────────┐
+│        meta_accounts        │ 1 ───▶ N│         ephemeral_addresses          │
+│─────────────────────────────│        │──────────────────────────────────────│
+│ id (PK)                     │        │ id (PK)                               │
+│ canonical_identifier UNIQUE │        │ meta_account_id (FK)                  │
+│ auth_methods_json           │        │ chain_id                              │
+│ created_at                  │        │ public_address UNIQUE                 │
+└─────────────────────────────┘        │ encrypted_key_shard (MPC network ID) │
+                                       │ pqc_signature_capable                 │
+                                       │ status  ('active'|'used'|'revoked')   │
+                                       │ created_at                            │
+                                       └──────────────────────────────────────┘
 ```
 
-* Table `wallets`. Stores encrypted private keys for users, linked to `users.id`.
-```sql
-CREATE TABLE IF NOT EXISTS wallets (
-    user_id BIGINT PRIMARY KEY REFERENCES users(id),    -- user_id: Foreign key referencing users(id) (SQL BIGINT mapped to Rust i32)
-    encrypted_privkey BYTEA NOT NULL,                   -- encrypted_privkey: AES-256-GCM encrypted private key
-    salt BYTEA NOT NULL                                 -- salt: Random salt for private key encryption
-)
-```
+---
 
-## 1. Register: `/register`
-Description: Registers a new user by storing their username, hashed password, encrypted TOTP secret, and salt in the users table.
-Database Actions:
-```sql
-INSERT INTO users (username, password_hash, encrypted_totp_secret, salt) VALUES ($1, $2, $3, $4) RETURNING id: Failed due to duplicate key value violates unique constraint "users_username_key" for testuser (rows_affected=0)
-```
+## Table Definitions
 
-Parameters:
-`$1`: username (e.g., testuser1).
-`$2`: `Argon2` hashed password (e.g., hashed `testpass1`).
-`$3`: `AES-256-GCM` encrypted TOTP secret (20 random bytes, base32-encoded for response).
-`$4`: Random salt (16 bytes) for hashing and encryption.
+### `meta_accounts`
 
-
-Effect: Creates a new row in the users table with a unique id. Returns the id for confirmation.
-Error Handling:
-If username already exists, returns `409 (Conflict)` with Username already exists.
-
-## 2. Login: `/login`
-
-Description: Authenticates a user by retrieving its data to verify the password and TOTP code, then issues a JWT token.
-Database Actions:
+Stores the canonical user identity. Authentication credentials (WebAuthn passkeys) are serialised as JSON into `auth_methods_json` — no passwords or password hashes are stored anywhere.
 
 ```sql
-SELECT id, password_hash, encrypted_totp_secret, salt FROM users WHERE username = $1
+CREATE TABLE IF NOT EXISTS meta_accounts (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_identifier TEXT    NOT NULL UNIQUE, -- username / email / DID
+    auth_methods_json    TEXT    NOT NULL,         -- serialised webauthn_rs::Passkey
+    created_at           DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
-Parameters:
-`$1`: username (e.g., `testuser1`).
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `INTEGER` | Auto-increment PK, maps to Rust `i64` |
+| `canonical_identifier` | `TEXT UNIQUE` | The user's stable identifier (e.g. email, DID) |
+| `auth_methods_json` | `TEXT` | JSON-serialised `webauthn_rs::Passkey`; future: array for multi-device support |
+| `created_at` | `DATETIME` | Server-side wall-clock insert time |
 
+---
 
-Effect: Retrieves the user’s `id`, `password_hash`, `encrypted_totp_secret`, and `salt` for authentication.
-Error Handling:
-If no user is found, returns `401 (Unauthorized)`.
+### `ephemeral_addresses`
 
-## Generate Signature Key: `/api/generate_key`
- 
-Description: Generates an Ethereum-compatible key pair, stores the encrypted private key in the wallets table, and returns the public address.
+One-to-many proxy addresses spawned from a Meta-Account via the MPC network. The actual private key **never** leaves the MPC enclave — only the network key identifier is stored here as `encrypted_key_shard`.
 
-Database Actions:
-1. 
 ```sql
-INSERT INTO wallets (user_id, encrypted_privkey, salt) VALUES ($1, $2, $3)  -- Created wallet record
+CREATE TABLE IF NOT EXISTS ephemeral_addresses (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    meta_account_id      INTEGER NOT NULL,
+    chain_id             TEXT    NOT NULL,        -- 'ethereum', 'solana', 'starknet', …
+    public_address       TEXT    NOT NULL UNIQUE, -- 0x… or Base58
+    encrypted_key_shard  BLOB    NOT NULL,        -- MPC network key ID (UTF-8 bytes)
+    pqc_signature_capable BOOLEAN DEFAULT 0,      -- false = Track A (ECDSA)
+                                                  -- true  = Track B (PQC / SPHINCS+)
+    status               TEXT    DEFAULT 'active', -- 'active' | 'used' | 'revoked'
+    created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (meta_account_id) REFERENCES meta_accounts(id)
+);
 ```
 
-Parameters:
-`$1`: User ID from JWT sub field (e.g., 3 for `testuser1`).
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `INTEGER` | Auto-increment PK |
+| `meta_account_id` | `INTEGER` | FK → `meta_accounts.id` |
+| `chain_id` | `TEXT` | Chain namespace string |
+| `public_address` | `TEXT UNIQUE` | The routable on-chain address |
+| `encrypted_key_shard` | `BLOB` | MPC network key ID stored as UTF-8 bytes; in Track A this is a UUID string issued by Turnkey/Lit Protocol |
+| `pqc_signature_capable` | `BOOLEAN` | Flags addresses minted using Track B PQC key generation (mock SPHINCS+) |
+| `status` | `TEXT` | Lifecycle: addresses move `active → used/revoked`; revocation via `UPDATE … SET status = 'revoked'` |
+| `created_at` | `DATETIME` | Server-side insert time |
 
-Effect: Retrieves `encrypted_totp_secret` and `salt` to verify the TOTP code and password.
+---
 
-2.
+## DB Operations Reference
+
+All operations are executed asynchronously by `DbClient` (`src/db.rs`) over a libSQL connection. The connection supports both local SQLite files and remote Turso replicas with automatic local caching.
+
+### Identity Management
+
+#### `create_meta_account`
+
+Called by `POST /meta_account/register_finish` after WebAuthn attestation succeeds.
+
 ```sql
-SELECT encrypted_totp_secret, salt FROM users WHERE id = $1                 -- Verified user
+INSERT INTO meta_accounts (canonical_identifier, auth_methods_json)
+VALUES (?1, ?2);
 ```
 
-Parameters:
-`$1`: User ID from JWT sub field.
-`$2`: `AES-256-GCM` encrypted private key (32 random bytes).
-`$3`: Random salt (16 bytes) for encryption.
+| Param | Value |
+|-------|-------|
+| `?1` | `canonical_identifier` from request |
+| `?2` | JSON-serialised `webauthn_rs::Passkey` |
 
-Effect: Creates a new row in the wallets table linked to the user.
-Error Handling:
-Returns `401 (Unauthorized)` if TOTP or password verification fails.
-Returns `500 (Internal Server Error)` if encryption or insertion fails.
+Returns: `last_insert_rowid()` → `meta_account_id`
 
+---
 
-## Message Signing: `/api/sign`
-Description: Signs a message using the user’s private key, retrieved from the wallets table.
-Database Actions:
+#### `get_meta_account_by_identifier`
 
-Schema action:
+Called by `POST /auth/login_start` to retrieve the stored passkey for challenge generation, and by `POST /auth/login_finish` to resolve the `meta_account_id` for JWT issuance.
+
 ```sql
-SELECT encrypted_totp_secret, salt FROM users WHERE id = $1     -- Verified user (rows_affected=1, rows_returned=1)
+SELECT id, canonical_identifier, auth_methods_json, created_at
+FROM   meta_accounts
+WHERE  canonical_identifier = ?1;
 ```
 
-Parameters:
-`$1`: User ID from JWT `sub` field
+Returns: `Option<MetaAccount>` — `None` produces `401 Unauthorized`.
 
-Effect: Retrieves encrypted_totp_secret and salt to verify TOTP and password.
+---
 
+### Ephemeral Address Lifecycle
 
-2.
+#### `create_ephemeral_address`
+
+Called by `POST /wallet/ephemeral/generate` and internally by `POST /paymaster/swap_intent` to create the one-time execution proxy.
+
 ```sql
-SELECT encrypted_privkey, salt FROM wallets WHERE user_id = $1  -- Retrieved wallet data (rows_affected=1, rows_returned=1)
+INSERT INTO ephemeral_addresses
+    (meta_account_id, chain_id, public_address, encrypted_key_shard, pqc_signature_capable)
+VALUES (?1, ?2, ?3, ?4, ?5);
 ```
 
-Parameters:
-`$1`: User ID from JWT sub field.
+| Param | Value |
+|-------|-------|
+| `?1` | `meta_account_id` |
+| `?2` | `chain_id` (e.g. `"ethereum"`) |
+| `?3` | Public address returned by MPC network |
+| `?4` | MPC network key ID bytes |
+| `?5` | `pqc_signature_capable` flag |
 
-Effect: Retrieves encrypted_privkey and salt to decrypt the private key for signing.
-Error Handling:
-Returns `401 (Unauthorized)` if no wallet exists or TOTP/password is invalid.
-Returns `500 (Internal Server Error)` if decryption or signing fails.
+Returns: `last_insert_rowid()` → `ephemeral_address_id`
 
-## Deletion of User’s TOTP Setup: `/api/forget`
-Description: Deletes the user’s wallet and user record from the database, allowing re-registration.
-Database Actions:
+---
 
-1. Start transaction: `BEGIN`
-Effect: Starts a transaction to ensure atomic deletion.
+#### `get_ephemeral_addresses_for_account`
 
-2.
+Called by `POST /wallet/ephemeral/list`.
+
 ```sql
-DELETE FROM users WHERE id = $1         -- Delete user from users table
+SELECT id, meta_account_id, chain_id, public_address,
+       encrypted_key_shard, pqc_signature_capable, status, created_at
+FROM   ephemeral_addresses
+WHERE  meta_account_id = ?1
+AND    status = 'active';
 ```
 
-Parameters:
-`$1`: User ID from JWT sub field.
+Returns: `Vec<EphemeralAddress>`
 
-Effect: Deletes the user’s wallet record (if it exists).
+---
 
-3.
+#### `revoke_ephemeral_address`
+
+Soft-deletes an address by updating its lifecycle status. The historical record is preserved.
+
 ```sql
-DELETE FROM wallets WHERE user_id = $1  -- Delete wallet from wallets table by user_id
+UPDATE ephemeral_addresses
+SET    status = 'revoked'
+WHERE  id = ?1;
 ```
 
-Parameters:
-`$1`: User ID from JWT sub field.
+---
 
-Effect: Deletes the user’s record from the users table.
+## Rust Domain Types
 
-4. Commit transaction: `COMMIT`
+These types are defined in `src/models/domain.rs` and imported where needed. They are the single source of truth.
 
-Effect: Commits the transaction to finalize deletions.
-Error Handling:
-Returns `401 (Unauthorized)` if TOTP or password verification fails.
-Returns `500 (Internal Server Error)` if deletion or transaction fails.
+```rust
+pub struct MetaAccount {
+    pub id:                   i64,
+    pub canonical_identifier: String,
+    pub auth_methods_json:    String,
+    pub created_at:           String,
+}
+
+pub struct EphemeralAddress {
+    pub id:                    i64,
+    pub meta_account_id:       i64,
+    pub chain_id:              String,
+    pub public_address:        String,
+    pub encrypted_key_shard:   Vec<u8>,
+    pub pqc_signature_capable: bool,
+    pub status:                String,
+    pub created_at:            String,
+}
+
+pub struct Claims {       // JWT payload
+    pub sub: i64,         // meta_account_id
+    pub exp: i64,         // Unix timestamp
+}
+```
+
+---
+
+## Migration Notes
+
+| Aspect | Legacy (PostgreSQL) | Current (Turso / libSQL) |
+|--------|--------------------|-----------------------|
+| Identity | `users` table: username + Argon2 hash + TOTP secret | `meta_accounts`: canonical ID + serialised WebAuthn passkey |
+| Keys | `wallets`: AES-GCM encrypted private key in DB | `ephemeral_addresses`: only MPC network key ID stored |
+| Auth | Password + TOTP | Passwordless FIDO2 / WebAuthn |
+| Scalability | Single-node Postgres | Multi-DC libSQL with local replica |
+| PQC | None | `pqc_signature_capable` flag; Track B mock SPHINCS+ via MPC |
