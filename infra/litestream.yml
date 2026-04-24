@@ -1,0 +1,31 @@
+# Litestream → Garage (self-hosted S3-compatible)
+# https://litestream.io/reference/config/
+#
+# Usage:
+#   litestream replicate -config infra/litestream.yml \
+#     -- sqld --db-path /var/lib/sqld/pqwaas.db \
+#             --http-listen-addr 0.0.0.0:8080
+
+dbs:
+  - path: /var/lib/sqld/pqwaas.db
+
+    replicas:
+      - type: s3
+        # Garage S3-compatible endpoint (local or remote node)
+        endpoint:         http://127.0.0.1:3900
+        access-key-id:    ${GARAGE_ACCESS_KEY_ID}
+        secret-access-key: ${GARAGE_SECRET_ACCESS_KEY}
+        bucket:           pqwaas-db-backups
+        path:             pqwaas/db
+        region:           garage             # must match s3_region in garage.toml
+        force-path-style: true               # required for Garage (no virtual hosting)
+
+        # Differential backup strategy:
+        # – WAL frames synced every 1 second (only changed pages uploaded)
+        # – Full snapshot every 6 hours (fallback baseline for restore)
+        # – 7 days retention window for point-in-time restore
+        sync-interval:            1s
+        snapshot-interval:        6h
+        retention:                168h
+        retention-check-interval: 1h
+        validation-interval:      24h       # Litestream verifies restore integrity daily

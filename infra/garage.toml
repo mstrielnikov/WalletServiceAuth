@@ -1,0 +1,38 @@
+# Garage S3-compatible object store — single-node self-hosted config
+# https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/
+#
+# Usage:
+#   garage -c infra/garage.toml server
+#
+# After first start, create bucket:
+#   garage bucket create pqwaas-db-backups
+#   garage key create litestream-key
+#   garage bucket allow --read --write --owner pqwaas-db-backups --key litestream-key
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir     = "/var/lib/garage/data"
+
+db_engine = "lmdb"          # fast embedded KV for metadata
+
+replication_factor = 1      # single-node; set to 3 for HA cluster
+consistency_mode   = "consistent"
+
+[s3_api]
+s3_region          = "garage"           # virtual region name (any string)
+api_bind_addr      = "0.0.0.0:3900"    # S3-compatible endpoint
+root_domain        = ".s3.local"
+
+[s3_web]
+bind_addr = "0.0.0.0:3902"
+root_domain = ".web.local"
+index = "index.html"
+
+[admin]
+api_bind_addr = "0.0.0.0:3903"
+
+[rpc_bind_addr]
+# Single-node: loopback only
+value = "0.0.0.0:3901"
+
+[rpc_public_addr]
+value = "127.0.0.1:3901"
